@@ -2,6 +2,7 @@
 #include <WiFi.h>
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
+#include <stdlib.h>
 
 
 const char WIFI_SSID[] = "AAAAAAAAAA!!";
@@ -13,292 +14,263 @@ String PATH_NAME   = "/nwis/iv/?format=json&sites=02335880&siteStatus=all";
 JsonDocument doc;
 
 
-#define BLACK 0x0000
-#define WHITE 0xFFFF
-
 #include <SPI.h>
 
 #include <TFT_eSPI.h> // Hardware-specific library
 
 TFT_eSPI tft = TFT_eSPI();       // Invoke custom library
 
-int16_t h;
-int16_t w;
+#define TFT_GREY 0x5AEB
 
-int inc = -2;
+float ltx = 0;    // Saved x coord of bottom of needle
+uint16_t osx = 120, osy = 120; // Saved x & y coords
+uint32_t updateTime = 0;       // time for next update
 
-float xx, xy, xz;
-float yx, yy, yz;
-float zx, zy, zz;
+int old_analog =  -999; // Value last displayed
+int old_digital = -999; // Value last displayed
 
-float fact;
+int value[6] = {0, 0, 0, 0, 0, 0};
+int old_value[6] = { -1, -1, -1, -1, -1, -1};
+int d = 0;
 
-int Xan, Yan;
 
-int Xoff;
-int Yoff;
-int Zoff;
-
-struct Point3d
+// #########################################################################
+// Update needle position
+// This function is blocking while needle moves, time depends on ms_delay
+// 10ms minimises needle flicker if text is drawn within needle sweep area
+// Smaller values OK if text not in sweep area, zero for instant movement but
+// does not look realistic... (note: 100 increments for full scale deflection)
+// #########################################################################
+void plotNeedle(int value, byte ms_delay)
 {
-  int x;
-  int y;
-  int z;
-};
+  tft.setTextColor(TFT_BLACK, TFT_WHITE);
+  char buf[8]; dtostrf(value, 4, 0, buf);
+  tft.drawRightString(buf, 80, 119 - 20, 2);
 
-struct Point2d
+  if (value < -10) value = -10; // Limit value to emulate needle end stops
+  if (value > 110) value = 110;
+
+  // Move the needle util new value reached
+  while (!(value == old_analog)) {
+    if (old_analog < value) old_analog++;
+    else old_analog--;
+
+    if (ms_delay == 0) old_analog = value; // Update immediately id delay is 0
+
+    float sdeg = map(old_analog, -10, 110, -150, -30); // Map value to angle
+    // Calculate tip of needle coords
+    float sx = cos(sdeg * 0.0174532925);
+    float sy = sin(sdeg * 0.0174532925);
+
+    // Calculate x delta of needle start (does not start at pivot point)
+    float tx = tan((sdeg + 90) * 0.0174532925);
+
+    // Erase old needle image
+    tft.drawLine(120 + 20 * ltx - 1, 140 - 20, osx - 1, osy, TFT_WHITE);
+    tft.drawLine(120 + 20 * ltx, 140 - 20, osx, osy, TFT_WHITE);
+    tft.drawLine(120 + 20 * ltx + 1, 140 - 20, osx + 1, osy, TFT_WHITE);
+
+    // Re-plot text under needle
+    tft.setTextColor(TFT_BLACK);
+    tft.drawCentreString("%RH", 120, 70, 4); // // Comment out to avoid font 4
+
+    // Store new needle end coords for next erase
+    ltx = tx;
+    osx = sx * 98 + 120;
+    osy = sy * 98 + 140;
+
+    // Draw the needle in the new postion, magenta makes needle a bit bolder
+    // draws 3 lines to thicken needle
+    tft.drawLine(120 + 20 * ltx - 1, 140 - 20, osx - 1, osy, TFT_RED);
+    tft.drawLine(120 + 20 * ltx, 140 - 20, osx, osy, TFT_MAGENTA);
+    tft.drawLine(120 + 20 * ltx + 1, 140 - 20, osx + 1, osy, TFT_RED);
+
+    // Slow needle down slightly as it approaches new postion
+    if (abs(old_analog - value) < 10) ms_delay += ms_delay / 5;
+
+    // Wait before next update
+    delay(ms_delay);
+  }
+}
+
+// #########################################################################
+//  Draw the analogue meter on the screen
+// #########################################################################
+void analogMeter()
 {
-  int x;
-  int y;
-};
+  // Meter outline
+  tft.fillRect(0, 0, 479, 126, TFT_GREY);
+  tft.fillRect(5, 3, 230, 119, TFT_WHITE);
 
-int LinestoRender; // lines to render.
-int OldLinestoRender; // lines to render just in case it changes. this makes sure the old lines all get erased.
+  tft.setTextColor(TFT_BLACK);  // Text colour
 
-struct Line3d
+  // Draw ticks every 5 degrees from -50 to +50 degrees (100 deg. FSD swing)
+  for (int i = -50; i < 51; i += 5) {
+    // Long scale tick length
+    int tl = 15;
+
+    // Coordinates of tick to draw
+    float sx = cos((i - 90) * 0.0174532925);
+    float sy = sin((i - 90) * 0.0174532925);
+    uint16_t x0 = sx * (100 + tl) + 120;
+    uint16_t y0 = sy * (100 + tl) + 140;
+    uint16_t x1 = sx * 100 + 120;
+    uint16_t y1 = sy * 100 + 140;
+
+    // Coordinates of next tick for zone fill
+    float sx2 = cos((i + 5 - 90) * 0.0174532925);
+    float sy2 = sin((i + 5 - 90) * 0.0174532925);
+    int x2 = sx2 * (100 + tl) + 120;
+    int y2 = sy2 * (100 + tl) + 140;
+    int x3 = sx2 * 100 + 120;
+    int y3 = sy2 * 100 + 140;
+
+    // Yellow zone limits
+    //if (i >= -50 && i < 0) {
+    //  tft.fillTriangle(x0, y0, x1, y1, x2, y2, TFT_YELLOW);
+    //  tft.fillTriangle(x1, y1, x2, y2, x3, y3, TFT_YELLOW);
+    //}
+
+    // Green zone limits
+    if (i >= 0 && i < 25) {
+      tft.fillTriangle(x0, y0, x1, y1, x2, y2, TFT_GREEN);
+      tft.fillTriangle(x1, y1, x2, y2, x3, y3, TFT_GREEN);
+    }
+
+    // Orange zone limits
+    if (i >= 25 && i < 50) {
+      tft.fillTriangle(x0, y0, x1, y1, x2, y2, TFT_ORANGE);
+      tft.fillTriangle(x1, y1, x2, y2, x3, y3, TFT_ORANGE);
+    }
+
+    // Short scale tick length
+    if (i % 25 != 0) tl = 8;
+
+    // Recalculate coords incase tick lenght changed
+    x0 = sx * (100 + tl) + 120;
+    y0 = sy * (100 + tl) + 140;
+    x1 = sx * 100 + 120;
+    y1 = sy * 100 + 140;
+
+    // Draw tick
+    tft.drawLine(x0, y0, x1, y1, TFT_BLACK);
+
+    // Check if labels should be drawn, with position tweaks
+    if (i % 25 == 0) {
+      // Calculate label positions
+      x0 = sx * (100 + tl + 10) + 120;
+      y0 = sy * (100 + tl + 10) + 140;
+      switch (i / 25) {
+        case -2: tft.drawCentreString("0", x0, y0 - 12, 2); break;
+        case -1: tft.drawCentreString("25", x0, y0 - 9, 2); break;
+        case 0: tft.drawCentreString("50", x0, y0 - 6, 2); break;
+        case 1: tft.drawCentreString("75", x0, y0 - 9, 2); break;
+        case 2: tft.drawCentreString("100", x0, y0 - 12, 2); break;
+      }
+    }
+
+    // Now draw the arc of the scale
+    sx = cos((i + 5 - 90) * 0.0174532925);
+    sy = sin((i + 5 - 90) * 0.0174532925);
+    x0 = sx * 100 + 120;
+    y0 = sy * 100 + 140;
+    // Draw scale arc, don't draw the last part
+    if (i < 50) tft.drawLine(x0, y0, x1, y1, TFT_BLACK);
+  }
+
+  tft.drawString("%RH", 5 + 230 - 40, 119 - 20, 2); // Units at bottom right
+  tft.drawCentreString("%RH", 120, 70, 4); // Comment out to avoid font 4
+  tft.drawRect(5, 3, 230, 119, TFT_BLACK); // Draw bezel line
+
+  plotNeedle(0, 0); // Put meter needle at 0
+}
+
+
+
+// #########################################################################
+//  Draw a linear meter on the screen
+// #########################################################################
+void plotLinear(char *label, int x, int y)
 {
-  Point3d p0;
-  Point3d p1;
-};
+  int w = 72;
+  tft.drawRect(x, y, w, 155, TFT_GREY);
+  tft.fillRect(x+2, y + 19, w-3, 155 - 38, TFT_WHITE);
+  tft.setTextColor(TFT_CYAN, TFT_BLACK);
+  tft.drawCentreString(label, x + w / 2, y + 2, 2);
 
-struct Line2d
-{
-  Point2d p0;
-  Point2d p1;
-};
-
-Line3d Lines[20];
-Line2d Render[20];
-Line2d ORender[20];
-
-void RenderImage( void)
-{
-  // renders all the lines after erasing the old ones.
-  // in here is the only code actually interfacing with the OLED. so if you use a different lib, this is where to change it.
-
-  for (int i = 0; i < OldLinestoRender; i++ )
+  for (int i = 0; i < 110; i += 10)
   {
-    tft.drawLine(ORender[i].p0.x, ORender[i].p0.y, ORender[i].p1.x, ORender[i].p1.y, BLACK); // erase the old lines.
+    tft.drawFastHLine(x + 20, y + 27 + i, 6, TFT_BLACK);
   }
 
-
-  for (int i = 0; i < LinestoRender; i++ )
+  for (int i = 0; i < 110; i += 50)
   {
-    uint16_t color = TFT_BLUE;
-    if (i < 4) color = TFT_RED;
-    if (i > 7) color = TFT_GREEN;
-    tft.drawLine(Render[i].p0.x, Render[i].p0.y, Render[i].p1.x, Render[i].p1.y, color);
+    tft.drawFastHLine(x + 20, y + 27 + i, 9, TFT_BLACK);
   }
-  OldLinestoRender = LinestoRender;
+  
+  tft.fillTriangle(x+3, y + 127, x+3+16, y+127, x + 3, y + 127 - 5, TFT_RED);
+  tft.fillTriangle(x+3, y + 127, x+3+16, y+127, x + 3, y + 127 + 5, TFT_RED);
+  
+  tft.drawCentreString("---", x + w / 2, y + 155 - 18, 2);
 }
 
-/***********************************************************************************************************************************/
-// Sets the global vars for the 3d transform. Any points sent through "process" will be transformed using these figures.
-// only needs to be called if Xan or Yan are changed.
-void SetVars(void)
+// #########################################################################
+//  Adjust 6 linear meter pointer positions
+// #########################################################################
+void plotPointer(void)
 {
-  float Xan2, Yan2, Zan2;
-  float s1, s2, s3, c1, c2, c3;
+  int dy = 187;
+  byte pw = 16;
 
-  Xan2 = Xan / fact; // convert degrees to radians.
-  Yan2 = Yan / fact;
+  tft.setTextColor(TFT_GREEN, TFT_BLACK);
 
-  // Zan is assumed to be zero
-
-  s1 = sin(Yan2);
-  s2 = sin(Xan2);
-
-  c1 = cos(Yan2);
-  c2 = cos(Xan2);
-
-  xx = c1;
-  xy = 0;
-  xz = -s1;
-
-  yx = (s1 * s2);
-  yy = c2;
-  yz = (c1 * s2);
-
-  zx = (s1 * c2);
-  zy = -s2;
-  zz = (c1 * c2);
-}
-
-
-/***********************************************************************************************************************************/
-// processes x1,y1,z1 and returns rx1,ry1 transformed by the variables set in SetVars()
-// fairly heavy on floating point here.
-// uses a bunch of global vars. Could be rewritten with a struct but not worth the effort.
-void ProcessLine(struct Line2d *ret, struct Line3d vec)
-{
-  float zvt1;
-  int xv1, yv1, zv1;
-
-  float zvt2;
-  int xv2, yv2, zv2;
-
-  int rx1, ry1;
-  int rx2, ry2;
-
-  int x1;
-  int y1;
-  int z1;
-
-  int x2;
-  int y2;
-  int z2;
-
-  int Ok;
-
-  x1 = vec.p0.x;
-  y1 = vec.p0.y;
-  z1 = vec.p0.z;
-
-  x2 = vec.p1.x;
-  y2 = vec.p1.y;
-  z2 = vec.p1.z;
-
-  Ok = 0; // defaults to not OK
-
-  xv1 = (x1 * xx) + (y1 * xy) + (z1 * xz);
-  yv1 = (x1 * yx) + (y1 * yy) + (z1 * yz);
-  zv1 = (x1 * zx) + (y1 * zy) + (z1 * zz);
-
-  zvt1 = zv1 - Zoff;
-
-  if ( zvt1 < -5) {
-    rx1 = 256 * (xv1 / zvt1) + Xoff;
-    ry1 = 256 * (yv1 / zvt1) + Yoff;
-    Ok = 1; // ok we are alright for point 1.
-  }
-
-  xv2 = (x2 * xx) + (y2 * xy) + (z2 * xz);
-  yv2 = (x2 * yx) + (y2 * yy) + (z2 * yz);
-  zv2 = (x2 * zx) + (y2 * zy) + (z2 * zz);
-
-  zvt2 = zv2 - Zoff;
-
-  if ( zvt2 < -5) {
-    rx2 = 256 * (xv2 / zvt2) + Xoff;
-    ry2 = 256 * (yv2 / zvt2) + Yoff;
-  } else
+  // Move the 6 pointers one pixel towards new value
+  for (int i = 0; i < 4; i++)
   {
-    Ok = 0;
+    char buf[8]; dtostrf(value[i], 4, 0, buf);
+    tft.drawRightString(buf, i * 80 + 72 - 5, 187 - 27 + 155 - 18, 2);
+
+    int dx = 3 + 80 * i;
+    if (value[i] < 0) value[i] = 0; // Limit value to emulate needle end stops
+    if (value[i] > 100) value[i] = 100;
+
+    while (!(value[i] == old_value[i])) {
+      dy = 187 + 100 - old_value[i];
+      if (old_value[i] > value[i])
+      {
+        tft.drawLine(dx, dy - 5, dx + pw, dy, TFT_WHITE);
+        old_value[i]--;
+        tft.drawLine(dx, dy + 6, dx + pw, dy + 1, TFT_RED);
+      }
+      else
+      {
+        tft.drawLine(dx, dy + 5, dx + pw, dy, TFT_WHITE);
+        old_value[i]++;
+        tft.drawLine(dx, dy - 6, dx + pw, dy - 1, TFT_RED);
+      }
+    }
   }
-
-  if (Ok == 1) {
-
-    ret->p0.x = rx1;
-    ret->p0.y = ry1;
-
-    ret->p1.x = rx2;
-    ret->p1.y = ry2;
-  }
-  // The ifs here are checks for out of bounds. needs a bit more code here to "safe" lines that will be way out of whack, so they don't get drawn and cause screen garbage.
-
 }
 
-/***********************************************************************************************************************************/
-// line segments to draw a cube. basically p0 to p1. p1 to p2. p2 to p3 so on.
-void cube(void)
-{
-  // Front Face.
 
-  Lines[0].p0.x = -50;
-  Lines[0].p0.y = -50;
-  Lines[0].p0.z = 50;
-  Lines[0].p1.x = 50;
-  Lines[0].p1.y = -50;
-  Lines[0].p1.z = 50;
-
-  Lines[1].p0.x = 50;
-  Lines[1].p0.y = -50;
-  Lines[1].p0.z = 50;
-  Lines[1].p1.x = 50;
-  Lines[1].p1.y = 50;
-  Lines[1].p1.z = 50;
-
-  Lines[2].p0.x = 50;
-  Lines[2].p0.y = 50;
-  Lines[2].p0.z = 50;
-  Lines[2].p1.x = -50;
-  Lines[2].p1.y = 50;
-  Lines[2].p1.z = 50;
-
-  Lines[3].p0.x = -50;
-  Lines[3].p0.y = 50;
-  Lines[3].p0.z = 50;
-  Lines[3].p1.x = -50;
-  Lines[3].p1.y = -50;
-  Lines[3].p1.z = 50;
+const char* Temp;
+const char* Flowrate;
+const char* Turbidity;
+const char* E_Coli;
 
 
-  //back face.
+void TitleBox() {
+  tft.setTextColor(TFT_PINK, TFT_BLACK);
+  tft.setCursor(270,40,4);
+  tft.println("Welcome to the");
+  tft.setCursor(270,65,4);
+  tft.println("Chattahoochee");
+  tft.setCursor(270,90,4);
+  tft.println("Scanner!");
 
-  Lines[4].p0.x = -50;
-  Lines[4].p0.y = -50;
-  Lines[4].p0.z = -50;
-  Lines[4].p1.x = 50;
-  Lines[4].p1.y = -50;
-  Lines[4].p1.z = -50;
-
-  Lines[5].p0.x = 50;
-  Lines[5].p0.y = -50;
-  Lines[5].p0.z = -50;
-  Lines[5].p1.x = 50;
-  Lines[5].p1.y = 50;
-  Lines[5].p1.z = -50;
-
-  Lines[6].p0.x = 50;
-  Lines[6].p0.y = 50;
-  Lines[6].p0.z = -50;
-  Lines[6].p1.x = -50;
-  Lines[6].p1.y = 50;
-  Lines[6].p1.z = -50;
-
-  Lines[7].p0.x = -50;
-  Lines[7].p0.y = 50;
-  Lines[7].p0.z = -50;
-  Lines[7].p1.x = -50;
-  Lines[7].p1.y = -50;
-  Lines[7].p1.z = -50;
-
-
-  // now the 4 edge lines.
-
-  Lines[8].p0.x = -50;
-  Lines[8].p0.y = -50;
-  Lines[8].p0.z = 50;
-  Lines[8].p1.x = -50;
-  Lines[8].p1.y = -50;
-  Lines[8].p1.z = -50;
-
-  Lines[9].p0.x = 50;
-  Lines[9].p0.y = -50;
-  Lines[9].p0.z = 50;
-  Lines[9].p1.x = 50;
-  Lines[9].p1.y = -50;
-  Lines[9].p1.z = -50;
-
-  Lines[10].p0.x = -50;
-  Lines[10].p0.y = 50;
-  Lines[10].p0.z = 50;
-  Lines[10].p1.x = -50;
-  Lines[10].p1.y = 50;
-  Lines[10].p1.z = -50;
-
-  Lines[11].p0.x = 50;
-  Lines[11].p0.y = 50;
-  Lines[11].p0.z = 50;
-  Lines[11].p1.x = 50;
-  Lines[11].p1.y = 50;
-  Lines[11].p1.z = -50;
-
-  LinestoRender = 12;
-  OldLinestoRender = LinestoRender;
-
+  // String title = "Welcome to Chattahooche Scanner";
+  // tft.drawString(title,300,80,3);
 }
-
 
 
 void setup() {
@@ -308,23 +280,9 @@ void setup() {
   Serial.println("Starting up");
 
 
- tft.init();
+  
 
-  h = tft.height();
-  w = tft.width();
-
-  tft.setRotation(1);
-
-  tft.fillScreen(TFT_BLACK);
-
-  cube();
-
-  fact = 180 / 3.14159259; // conversion from degrees to radians.
-
-  Xoff = 240; // Position the centre of the 3d conversion space into the centre of the TFT screen.
-  Yoff = 160;
-  Zoff = 550; // Z offset in 3D space (smaller = closer and bigger rendering)
-
+  updateTime = millis(); // Next update time
   while(WiFi.status() != WL_CONNECTED) {
     delay(500);
     Serial.print(".");
@@ -359,22 +317,22 @@ void setup() {
       // JsonObject value_timeSeries_0_variable = value_timeSeries_0["variable"];
       JsonObject value_timeSeries_0_values_0 = value_timeSeries_0["values"][0];
       JsonObject value_timeSeries_0_values_0_value_0 = value_timeSeries_0_values_0["value"][0];
-      const char* Temp = value_timeSeries_0_values_0_value_0["value"];
+      Temp = value_timeSeries_0_values_0_value_0["value"];
 
       JsonObject value_timeSeries_2 = value_timeSeries[2];
       JsonObject value_timeSeries_2_values_0 = value_timeSeries_2["values"][0];
       JsonObject value_timeSeries_2_values_0_value_0 = value_timeSeries_2_values_0["value"][0];
-      const char* Flowrate = value_timeSeries_2_values_0_value_0["value"];
+      Flowrate = value_timeSeries_2_values_0_value_0["value"];
 
       JsonObject value_timeSeries_5 = value_timeSeries[5];
       JsonObject value_timeSeries_5_values_0 = value_timeSeries_5["values"][0];
       JsonObject value_timeSeries_5_values_0_value_0 = value_timeSeries_5_values_0["value"][0];
-      const char* Turbidity = value_timeSeries_5_values_0_value_0["value"];
+      Turbidity = value_timeSeries_5_values_0_value_0["value"];
 
       JsonObject value_timeSeries_6 = value_timeSeries[6];
       JsonObject value_timeSeries_6_values_0 = value_timeSeries_6["values"][0];
       JsonObject value_timeSeries_6_values_0_value_0 = value_timeSeries_6_values_0["value"][0];
-      const char* E_Coli = value_timeSeries_6_values_0_value_0["value"];
+      E_Coli = value_timeSeries_6_values_0_value_0["value"];
 
 
       Serial.printf("Temp: %s\n", Temp);
@@ -391,36 +349,60 @@ void setup() {
     Serial.printf("[HTTP] GET... failed, error: %s\n", http.errorToString(httpCode).c_str());
   }
   http.end();
+
+
+  tft.init();
+  tft.setRotation(1);
+  Serial.begin(57600); // For debug
+  tft.fillScreen(TFT_BLACK);
+
+  analogMeter(); // Draw analogue meter
+  TitleBox();
+
+  // Draw 6 linear meters
+  byte d = 80;
+  plotLinear("Temp", 0, 160);
+  plotLinear("Flow", 1 * d, 160);
+  plotLinear("Turb", 2 * d, 160);
+  plotLinear("E.Coli", 3 * d, 160);
+  
   
 }
 
 void loop() {
-  // put your main code here, to run repeatedly:
+  if (updateTime <= millis()) {
+    updateTime = millis() + 25; // Delay to limit speed of update
+ 
+    d += 4; if (d >= 360) d = 0;
 
-  // Rotate around x and y axes in 1 degree increments
-  Xan++;
-  Yan++;
+    //value[0] = map(analogRead(A0), 0, 1023, 0, 100); // Test with value form Analogue 0
+    //value[1] = map(analogRead(A1), 0, 1023, 0, 100); // Test with value form Analogue 1
+    //value[2] = map(analogRead(A2), 0, 1023, 0, 100); // Test with value form Analogue 2
+    //value[3] = map(analogRead(A3), 0, 1023, 0, 100); // Test with value form Analogue 3
+    //value[4] = map(analogRead(A4), 0, 1023, 0, 100); // Test with value form Analogue 4
+    //value[5] = map(analogRead(A5), 0, 1023, 0, 100); // Test with value form Analogue 5
 
-  Yan = Yan % 360;
-  Xan = Xan % 360; // prevents overflow.
+    // Create a Sine wave for testing
+    // value[0] = 50 + 50 * sin((d + 0) * 0.0174532925);
+    // value[1] = 50 + 50 * sin((d + 60) * 0.0174532925);
+    // value[2] = 50 + 50 * sin((d + 120) * 0.0174532925);
+    // value[3] = 50 + 50 * sin((d + 180) * 0.0174532925);
+    // value[4] = 50 + 50 * sin((d + 240) * 0.0174532925);
+    // value[5] = 50 + 50 * sin((d + 300) * 0.0174532925);
 
-  SetVars(); //sets up the global vars to do the 3D conversion.
 
-  // Zoom in and out on Z axis within limits
-  // the cube intersects with the screen for values < 160
-  Zoff += inc; 
-  if (Zoff > 500) inc = -1;     // Switch to zoom in
-  else if (Zoff < 160) inc = 1; // Switch to zoom out
-
-  for (int i = 0; i < LinestoRender ; i++)
-  {
-    ORender[i] = Render[i]; // stores the old line segment so we can delete it later.
-    ProcessLine(&Render[i], Lines[i]); // converts the 3d line segments to 2d.
+    value[0] = atoi(Temp);
+    value[1] = atoi(Flowrate);
+    value[2] = atoi(Turbidity);
+    value[3] = atoi(E_Coli);
+    // value[4] = 50 + 50 * sin((d + 240) * 0.0174532925);
+    // value[5] = 50 + 50 * sin((d + 300) * 0.0174532925);
+    
+    //unsigned long t = millis(); 
+    plotPointer(); // It takes aout 3.5ms to plot each gauge for a 1 pixel move, 21ms for 6 gauges
+     
+    plotNeedle(value[0], 0); // It takes between 2 and 12ms to replot the needle with zero delay
+    //Serial.println(millis()-t); // Print time taken for meter update
   }
-  RenderImage(); // go draw it!
-
-  delay(14); // Delay to reduce loop rate (reduces flicker caused by aliasing with TFT screen refresh rate)
 }
-
-
 
